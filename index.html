@@ -764,6 +764,7 @@ function restoreCacheFromStorage(){
     kehadiranRangeCache = JSON.parse(localStorage.getItem(LS_KEYS.kehadiranRangeCache) || 'null') || {};
     kasusCache = JSON.parse(localStorage.getItem(LS_KEYS.kasusCache) || 'null') || {};
     umpanBalikCache = JSON.parse(localStorage.getItem(LS_KEYS.umpanBalikCache) || 'null') || {};
+    [siswaList, actionSummary, kehadiranCache, kehadiranRangeCache, kasusCache, umpanBalikCache].forEach(normalizeRows);
     lastCacheSavedAt = parseInt(localStorage.getItem(LS_KEYS.savedAt) || '0', 10) || 0;
     return { ada:true, umurMs: lastCacheSavedAt ? (Date.now() - lastCacheSavedAt) : Infinity };
   }catch(e){
@@ -798,6 +799,17 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000){
   }
 }
 
+/* Google Sheets bisa mengembalikan kelas/nama/no yang tampak seperti angka (mis. kelas "4")
+   sebagai tipe number. Semua nilai ini dipaksa menjadi teks agar .localeCompare, ===, dll. aman. */
+function normalizeRows(data){
+  if(Array.isArray(data)){ data.forEach(normalizeRows); }
+  else if(data && typeof data === 'object'){
+    ['kelas','nama','no'].forEach(k=>{ if(k in data && data[k] !== null && data[k] !== undefined && typeof data[k] !== 'object') data[k] = String(data[k]).trim(); });
+    Object.keys(data).forEach(k=>{ if(data[k] && typeof data[k] === 'object') normalizeRows(data[k]); });
+  }
+  return data;
+}
+
 async function apiGet(action, params = {}){
   const qs = new URLSearchParams({ action, ...params }).toString();
   const res = await fetchWithTimeout(GAS_URL + '?' + qs);
@@ -805,7 +817,7 @@ async function apiGet(action, params = {}){
   try{ json = await res.json(); }
   catch(e){ throw new Error('Respons server tidak valid (bukan JSON). Cek deployment Apps Script.'); }
   if(!json.ok) throw new Error(json.error || 'Gagal memuat data');
-  return json.data;
+  return normalizeRows(json.data);
 }
 
 async function apiPost(action, payload){
@@ -976,7 +988,7 @@ document.getElementById('syncBtn').addEventListener('click', async ()=>{
 });
 
 /* ======================= UTIL ======================= */
-function uniqueKelas(){ return [...new Set(siswaList.map(s=>s.kelas).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'id')); }
+function uniqueKelas(){ return [...new Set(siswaList.map(s=>s.kelas).filter(Boolean))].sort((a,b)=>String(a).localeCompare(String(b),'id',{numeric:true})); }
 function studentsInKelas(kelas){ return siswaList.filter(s=>s.kelas===kelas).sort((a,b)=>(a.no+'').localeCompare(b.no+'','id',{numeric:true})); }
 function escapeHtml(str){ return String(str??'').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 function fmtTanggal(iso){ if(!iso) return ''; const d = new Date(iso+'T00:00:00'); return d.toLocaleDateString('id-ID', {day:'2-digit', month:'short', year:'numeric'}); }
@@ -1059,7 +1071,7 @@ function renderDataSiswaList(){
     if(kelasFilter && s.kelas!==kelasFilter) return false;
     if(search && !s.nama.toLowerCase().includes(search)) return false;
     return true;
-  }).sort((a,b)=> a.kelas.localeCompare(b.kelas,'id') || (a.no+'').localeCompare(b.no+'','id',{numeric:true}));
+  }).sort((a,b)=> String(a.kelas).localeCompare(String(b.kelas),'id',{numeric:true}) || (a.no+'').localeCompare(b.no+'','id',{numeric:true}));
 
   document.getElementById('dsCount').textContent = `(${list.length}/${siswaList.length})`;
 
@@ -1276,7 +1288,7 @@ async function renderGuruRekap(){
     if(perStudentMap[key] && counts[r.status] !== undefined){ perStudentMap[key][r.status] = (perStudentMap[key][r.status] || 0) + 1; }
   });
 
-  const perStudentRows = Object.values(perStudentMap).sort((a,b)=> a.kelas.localeCompare(b.kelas,'id') || (a.no+'').localeCompare(b.no+'','id',{numeric:true})).map(item=>`
+  const perStudentRows = Object.values(perStudentMap).sort((a,b)=> String(a.kelas).localeCompare(String(b.kelas),'id',{numeric:true}) || (a.no+'').localeCompare(b.no+'','id',{numeric:true})).map(item=>`
     <div class="status-row stack" style="padding:10px 4px;">
       <div class="who">
         <div class="name">${escapeHtml(item.nama)}</div>
@@ -1504,7 +1516,7 @@ async function exportRekapExcel(kelasSel, start, end){
       const nameOf = {}; siswaList.forEach(st=>{ nameOf[studentKey(st)] = st.nama; });
       const det = [['Tanggal','Kelas','No','Nama','Status','Keterangan']];
       records.filter(r=>classes.includes(r.kelas))
-        .sort((a,b)=>String(a.tanggal||'').localeCompare(String(b.tanggal||'')) || a.kelas.localeCompare(b.kelas,'id') || (a.no+'').localeCompare(b.no+'','id',{numeric:true}))
+        .sort((a,b)=>String(a.tanggal||'').localeCompare(String(b.tanggal||'')) || String(a.kelas).localeCompare(String(b.kelas),'id',{numeric:true}) || (a.no+'').localeCompare(b.no+'','id',{numeric:true}))
         .forEach(r=>det.push([String(r.tanggal||'').slice(0,10), r.kelas, isNaN(Number(r.no))?r.no:Number(r.no), r.nama || nameOf[`${r.kelas}::${r.no}`] || '', r.status, r.keterangan || r.catatan || '']));
       const wsD = XLSX.utils.aoa_to_sheet(det);
       wsD['!cols'] = [{wch:12},{wch:12},{wch:6},{wch:34},{wch:10},{wch:28}];
@@ -1527,7 +1539,7 @@ function exportKehadiranHarianExcel(){
   if(!kelas || !tanggal){ toast('Pilih tanggal dan kelas terlebih dahulu', true); return; }
   if(typeof XLSX === 'undefined'){ toast('Library Excel belum termuat. Periksa koneksi internet.', true); return; }
   const students = (kelas === 'all' ? [...siswaList] : studentsInKelas(kelas))
-    .sort((a,b)=> a.kelas.localeCompare(b.kelas,'id') || (a.no+'').localeCompare(b.no+'','id',{numeric:true}));
+    .sort((a,b)=> String(a.kelas).localeCompare(String(b.kelas),'id',{numeric:true}) || (a.no+'').localeCompare(b.no+'','id',{numeric:true}));
   if(students.length===0){ toast('Belum ada siswa di kelas ini', true); return; }
   try{
     const num = v => isNaN(Number(v)) || v==='' ? v : Number(v);
@@ -1883,7 +1895,7 @@ function renderWaliKartu(kelas){
 
 function renderWaliList(kelas, list){
   const wrap = document.getElementById('waliListWrap');
-  const sorted = [...list].sort((a,b)=> b.tanggal.localeCompare(a.tanggal));
+  const sorted = [...list].sort((a,b)=> String(b.tanggal).localeCompare(String(a.tanggal)));
   if(sorted.length===0){ wrap.innerHTML = `<div class="empty-state"><span class="ico">📝</span>Belum ada catatan untuk kelas ini.</div>`; return; }
   wrap.innerHTML = sorted.map(k=>renderCaseCard(k)).join('');
   attachCaseCardHandlers(wrap, kelas);
@@ -2103,7 +2115,7 @@ function renderStatusRankCard(wrapId, statField, records, emoji){
   if(!wrap) return;
   const stats = computeStatusCountsPerSiswa(records)
     .filter(s => s[statField] > 0)
-    .sort((a,b)=> b[statField] - a[statField] || a.nama.localeCompare(b.nama,'id'));
+    .sort((a,b)=> b[statField] - a[statField] || String(a.nama).localeCompare(String(b.nama),'id'));
 
   if(stats.length===0){
     wrap.innerHTML = `<div class="empty-state"><span class="ico">${emoji}</span>Tidak ada catatan ${statField} pada periode ini.</div>`;
@@ -2209,7 +2221,7 @@ function renderPoinRank(){
   const kelasFilter = document.getElementById('poinKelasFilter').value;
   let list = siswaList.filter(s=> !kelasFilter || s.kelas===kelasFilter)
     .slice()
-    .sort((a,b)=> (a.poin ?? POIN_AWAL) - (b.poin ?? POIN_AWAL) || a.nama.localeCompare(b.nama,'id'));
+    .sort((a,b)=> (a.poin ?? POIN_AWAL) - (b.poin ?? POIN_AWAL) || String(a.nama).localeCompare(String(b.nama),'id'));
 
   if(list.length===0){ wrap.innerHTML = `<div class="empty-state"><span class="ico">🏅</span>Belum ada data siswa.</div>`; return; }
 
