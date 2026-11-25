@@ -471,6 +471,7 @@
 
     <div class="card" id="guruTableCard" style="display:none;">
       <h2><span class="num">02</span>Daftar Siswa &amp; Status</h2>
+      <button class="btn" id="btnExcelHarian" style="margin-bottom:12px; background:var(--hadir); border-color:var(--hadir);">📥 Unduh Kehadiran Hari Ini (.xlsx)</button>
       <div id="guruTableWrap"></div>
     </div>
 
@@ -577,6 +578,7 @@
 
     <div class="card" id="waliListCard" style="display:none;">
       <h2><span class="num">03</span>Riwayat Catatan</h2>
+      <button class="btn" id="btnExcelWali" style="margin-bottom:12px; background:var(--hadir); border-color:var(--hadir);">📥 Unduh Laporan Excel (.xlsx)</button>
       <div id="waliListWrap"></div>
     </div>
 
@@ -1516,6 +1518,57 @@ async function exportRekapExcel(kelasSel, start, end){
     toast('Gagal membuat Excel: '+err.message, true);
   }finally{ hideLoading(); }
 }
+/* =====================================================================
+   EXPORT EXCEL — Kehadiran harian (sesuai tanggal & kelas di layar Guru Piket)
+   ===================================================================== */
+function exportKehadiranHarianExcel(){
+  const kelas = document.getElementById('guruKelas').value;
+  const tanggal = document.getElementById('guruTanggal').value;
+  if(!kelas || !tanggal){ toast('Pilih tanggal dan kelas terlebih dahulu', true); return; }
+  if(typeof XLSX === 'undefined'){ toast('Library Excel belum termuat. Periksa koneksi internet.', true); return; }
+  const students = (kelas === 'all' ? [...siswaList] : studentsInKelas(kelas))
+    .sort((a,b)=> a.kelas.localeCompare(b.kelas,'id') || (a.no+'').localeCompare(b.no+'','id',{numeric:true}));
+  if(students.length===0){ toast('Belum ada siswa di kelas ini', true); return; }
+  try{
+    const num = v => isNaN(Number(v)) || v==='' ? v : Number(v);
+    const tglLabel = new Date(tanggal+'T00:00:00').toLocaleDateString('id-ID', {weekday:'long', day:'2-digit', month:'long', year:'numeric'});
+    const head = [
+      ['DATA KEHADIRAN SISWA'],
+      ['SDN Bojongkasih'],
+      ['Tanggal', tglLabel],
+      ['Kelas', kelas === 'all' ? 'Semua kelas' : kelas],
+      [],
+      ['No','Nama','Kelas','Status','Keterangan']
+    ];
+    const first = head.length + 1;
+    const aoa = head.slice();
+    const counts = {Hadir:0, Sakit:0, Izin:0, Alpa:0};
+    students.forEach(st=>{
+      const status = currentGuruRecord[studentKey(st)] || 'Hadir';
+      if(counts[status] !== undefined) counts[status]++;
+      aoa.push([num(st.no), st.nama, st.kelas, status, status==='Hadir' ? 'Hadir' : status==='Sakit' ? 'Sakit' : status==='Izin' ? 'Izin' : 'Alpa (tanpa keterangan)']);
+    });
+    const last = first + students.length - 1;
+    aoa.push([]);
+    aoa.push(['','Rekap','', '', '']);
+    ['Hadir','Sakit','Izin','Alpa'].forEach(k=>{
+      aoa.push(['', k, '', {t:'n', f:`COUNTIF(D${first}:D${last},"${k}")`, v:counts[k]}, '']);
+    });
+    aoa.push(['', 'Total siswa', '', {t:'n', f:`COUNTA(D${first}:D${last})`, v:students.length}, '']);
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [{wch:6},{wch:34},{wch:12},{wch:12},{wch:24}];
+    ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:4}},{s:{r:1,c:0},e:{r:1,c:4}}];
+    ws['!autofilter'] = {ref:`A${first-1}:E${last}`};
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Kehadiran');
+    const label = kelas === 'all' ? 'Semua_Kelas' : String(kelas).replace(/[^\w\-]+/g,'_');
+    XLSX.writeFile(wb, `Kehadiran_${label}_${tanggal}.xlsx`);
+    toast('File Excel berhasil diunduh');
+  }catch(err){
+    toast('Gagal membuat Excel: '+err.message, true);
+  }
+}
+document.getElementById('btnExcelHarian').addEventListener('click', exportKehadiranHarianExcel);
 document.getElementById('btnExcelRekap').addEventListener('click', ()=>{
   exportRekapExcel(document.getElementById('guruRekapKelas').value || 'all',
     document.getElementById('guruRekapStart').value, document.getElementById('guruRekapEnd').value);
@@ -1524,6 +1577,81 @@ document.getElementById('btnExcelKepsek').addEventListener('click', ()=>{
   exportRekapExcel('all',
     document.getElementById('kepsekTanggalStart').value, document.getElementById('kepsekTanggalEnd').value);
 });
+
+/* =====================================================================
+   EXPORT EXCEL — Laporan Wali Kelas (kasus, riwayat penanganan, umpan balik)
+   ===================================================================== */
+async function exportWaliExcel(){
+  const kelas = document.getElementById('waliKelas').value;
+  if(!kelas){ toast('Pilih kelas wali terlebih dahulu', true); return; }
+  if(typeof XLSX === 'undefined'){ toast('Library Excel belum termuat. Periksa koneksi internet.', true); return; }
+
+  showLoading('Menyiapkan file Excel...');
+  try{
+    const kasus = [...(await loadKasus(kelas))].sort((a,b)=> String(a.tanggal).localeCompare(String(b.tanggal)));
+    let umpan = [];
+    try{ umpan = [...(await loadUmpanBalik(kelas))].sort((a,b)=> String(a.dibuat).localeCompare(String(b.dibuat))); }catch(e){ /* umpan balik opsional */ }
+    const students = studentsInKelas(kelas);
+    const wb = XLSX.utils.book_new();
+    const num = v => isNaN(Number(v)) || v==='' ? v : Number(v);
+    const stamp = new Date().toLocaleString('id-ID');
+
+    // 1. Ringkasan per siswa
+    const perSiswa = students.map(st=>{
+      const ks = kasus.filter(k=>String(k.no)===String(st.no));
+      const pel = ks.filter(k=>k.poin<0).length;
+      const pres = ks.filter(k=>k.poin>0).length;
+      const open = ks.filter(k=>k.status!=='Selesai').length;
+      return [num(st.no), st.nama, getStudentPoin(st.no, kelas), ks.length, pel, pres, open];
+    });
+    const aoa1 = [
+      ['LAPORAN WALI KELAS - '+kelas],
+      ['SDN Bojongkasih'],
+      ['Dibuat pada', stamp],
+      [],
+      ['No','Nama Siswa','Poin Kedisiplinan','Jumlah Catatan','Pelanggaran','Prestasi','Belum Selesai']
+    ];
+    aoa1.push(...perSiswa);
+    const ws1 = XLSX.utils.aoa_to_sheet(aoa1);
+    ws1['!cols'] = [{wch:6},{wch:34},{wch:18},{wch:15},{wch:13},{wch:10},{wch:14}];
+    ws1['!merges'] = [{s:{r:0,c:0},e:{r:0,c:6}},{s:{r:1,c:0},e:{r:1,c:6}}];
+    XLSX.utils.book_append_sheet(wb, ws1, 'Ringkasan Siswa');
+
+    // 2. Catatan kasus
+    const aoa2 = [['Tanggal','No','Nama','Kelas','Jenis Kejadian','Kategori','Poin','Status','Deskripsi','Tindakan Awal','Jumlah Tindak Lanjut']];
+    kasus.forEach(k=> aoa2.push([
+      String(k.tanggal||'').slice(0,10), num(k.no), k.nama, k.kelas, k.jenis,
+      KATEGORI_LABEL[k.kategori] || k.kategori || '', Number(k.poin)||0,
+      STATUS_LABEL[k.status] || k.status || '', k.deskripsi || '', k.tindakan || '', (k.histori||[]).length
+    ]));
+    const ws2 = XLSX.utils.aoa_to_sheet(aoa2);
+    ws2['!cols'] = [{wch:12},{wch:6},{wch:28},{wch:10},{wch:30},{wch:16},{wch:7},{wch:16},{wch:50},{wch:40},{wch:12}];
+    XLSX.utils.book_append_sheet(wb, ws2, 'Catatan Kasus');
+
+    // 3. Riwayat penanganan (tindak lanjut)
+    const aoa3 = [['Tanggal Kasus','No','Nama','Jenis Kejadian','Waktu Tindak Lanjut','Catatan Tindak Lanjut']];
+    kasus.forEach(k=> (k.histori||[]).forEach(h=> aoa3.push([
+      String(k.tanggal||'').slice(0,10), num(k.no), k.nama, k.jenis, fmtTimestamp(h.tanggal), h.catatan || ''
+    ])));
+    const ws3 = XLSX.utils.aoa_to_sheet(aoa3);
+    ws3['!cols'] = [{wch:14},{wch:6},{wch:28},{wch:30},{wch:22},{wch:60}];
+    XLSX.utils.book_append_sheet(wb, ws3, 'Riwayat Penanganan');
+
+    // 4. Umpan balik orang tua
+    const aoa4 = [['Waktu Dikirim','Nama Siswa','Kelas','Pesan','Status']];
+    umpan.forEach(f=> aoa4.push([fmtTimestamp(f.dibuat), f.nama || '', f.kelas || kelas, f.pesan || '', f.status==='Dibaca' ? 'Sudah Dibaca' : 'Belum Dibaca']));
+    const ws4 = XLSX.utils.aoa_to_sheet(aoa4);
+    ws4['!cols'] = [{wch:22},{wch:28},{wch:10},{wch:70},{wch:14}];
+    XLSX.utils.book_append_sheet(wb, ws4, 'Umpan Balik Ortu');
+
+    const label = String(kelas).replace(/[^\w\-]+/g,'_');
+    XLSX.writeFile(wb, `Laporan_Wali_Kelas_${label}_${todayISO()}.xlsx`);
+    toast('File Excel berhasil diunduh');
+  }catch(err){
+    toast('Gagal membuat Excel: '+err.message, true);
+  }finally{ hideLoading(); }
+}
+document.getElementById('btnExcelWali').addEventListener('click', exportWaliExcel);
 
 document.getElementById('btnHadirSemua').addEventListener('click', ()=>{
   const kelas = document.getElementById('guruKelas').value;
