@@ -488,6 +488,7 @@
           <button class="btn brass" id="btnTampilkanRekap">Tampilkan Rekap</button>
           <button class="btn secondary" id="btnCetakRekap">Cetak Laporan</button>
         </div>
+        <button class="btn" id="btnExcelRekap" style="background:var(--hadir); border-color:var(--hadir);">📥 Unduh Laporan Excel (.xlsx)</button>
       </div>
       <div id="guruRekapWrap" style="margin-top:12px;"></div>
     </div>
@@ -596,6 +597,7 @@
           <input type="date" id="kepsekTanggalEnd">
         </div>
       </div>
+      <button class="btn" id="btnExcelKepsek" style="margin-top:10px; background:var(--hadir); border-color:var(--hadir);">📥 Unduh Laporan Excel (.xlsx)</button>
       <div id="kepsekRekapWrap" style="margin-top:12px;"></div>
     </div>
 
@@ -1389,6 +1391,139 @@ document.getElementById('guruRekapStart').addEventListener('change', renderGuruR
 document.getElementById('guruRekapEnd').addEventListener('change', renderGuruRekap);
 document.getElementById('btnTampilkanRekap').addEventListener('click', renderGuruRekap);
 document.getElementById('btnCetakRekap').addEventListener('click', printGuruRekap);
+
+/* =====================================================================
+   EXPORT EXCEL — Rekap Kehadiran
+   Sheet "Ringkasan" (per kelas) + 1 sheet per kelas (per siswa) +
+   sheet "Detail" bila data harian memiliki kolom tanggal.
+   ===================================================================== */
+function safeSheetName(name, used){
+  let n = String(name||'Sheet').replace(/[\\\/\?\*\[\]:]/g,'-').slice(0,31) || 'Sheet';
+  let base = n, i = 2;
+  while(used.has(n.toLowerCase())){ const suf=' ('+(i++)+')'; n = base.slice(0,31-suf.length)+suf; }
+  used.add(n.toLowerCase());
+  return n;
+}
+async function exportRekapExcel(kelasSel, start, end){
+  if(typeof XLSX === 'undefined'){ toast('Library Excel belum termuat. Periksa koneksi internet.', true); return; }
+  if(!start || !end){ toast('Isi rentang tanggal terlebih dahulu', true); return; }
+  if(new Date(start+'T00:00:00') > new Date(end+'T00:00:00')){ toast('Rentang tanggal tidak valid', true); return; }
+  const classes = kelasSel === 'all' ? uniqueKelas() : [kelasSel];
+  if(classes.length===0){ toast('Belum ada data kelas', true); return; }
+
+  showLoading('Menyiapkan file Excel...');
+  try{
+    let records;
+    if(kelasSel === 'all'){ records = await loadKehadiranRange('all', start, end); }
+    else { records = await loadKehadiranRange(kelasSel, start, end); }
+
+    const periode = `${fmtTanggal(start)} - ${fmtTanggal(end)}`;
+    const wb = XLSX.utils.book_new();
+    const used = new Set();
+    const ringkasan = [
+      ['LAPORAN REKAP KEHADIRAN SISWA'],
+      ['SDN Bojongkasih'],
+      ['Periode', periode],
+      ['Dibuat pada', new Date().toLocaleString('id-ID')],
+      [],
+      ['Kelas','Jumlah Siswa','Hadir','Sakit','Izin','Alpa','Total Entri','% Hadir']
+    ];
+    const ringkasanStart = ringkasan.length + 1; // baris data pertama (1-based)
+    const kelasSheets = [];
+
+    classes.forEach(kelas=>{
+      const recs = records.filter(r=>r.kelas===kelas);
+      const students = studentsInKelas(kelas);
+      const map = {};
+      students.forEach(st=>{ map[studentKey(st)] = {no:st.no, nama:st.nama, Hadir:0, Sakit:0, Izin:0, Alpa:0}; });
+      recs.forEach(r=>{
+        const m = map[`${r.kelas}::${r.no}`];
+        if(m && m[r.status] !== undefined) m[r.status]++;
+      });
+      const rows = Object.values(map).sort((a,b)=>(a.no+'').localeCompare(b.no+'','id',{numeric:true}));
+
+      const head = [['REKAP KEHADIRAN - '+kelas],['Periode', periode],[],['No','Nama','Hadir','Sakit','Izin','Alpa','Total','% Hadir']];
+      const first = head.length + 1;
+      const aoa = head.slice();
+      rows.forEach((r,i)=>{
+        const rn = first + i, tot = r.Hadir+r.Sakit+r.Izin+r.Alpa;
+        aoa.push([
+          isNaN(Number(r.no)) ? r.no : Number(r.no), r.nama, r.Hadir, r.Sakit, r.Izin, r.Alpa,
+          {t:'n', f:`SUM(C${rn}:F${rn})`, v:tot},
+          {t:'n', f:`IF(G${rn}=0,0,C${rn}/G${rn})`, v: tot? r.Hadir/tot : 0, z:'0%'}
+        ]);
+      });
+      const last = first + rows.length - 1;
+      const sum = k => rows.reduce((a,r)=>a+r[k],0);
+      const tH=sum('Hadir'), tS=sum('Sakit'), tI=sum('Izin'), tA=sum('Alpa'), tAll=tH+tS+tI+tA;
+      if(rows.length){
+        const tr = last + 1;
+        aoa.push(['', 'TOTAL',
+          {t:'n', f:`SUM(C${first}:C${last})`, v:tH}, {t:'n', f:`SUM(D${first}:D${last})`, v:tS},
+          {t:'n', f:`SUM(E${first}:E${last})`, v:tI}, {t:'n', f:`SUM(F${first}:F${last})`, v:tA},
+          {t:'n', f:`SUM(G${first}:G${last})`, v:tAll},
+          {t:'n', f:`IF(G${tr}=0,0,C${tr}/G${tr})`, v: tAll? tH/tAll : 0, z:'0%'}
+        ]);
+      }
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws['!cols'] = [{wch:6},{wch:34},{wch:9},{wch:9},{wch:9},{wch:9},{wch:9},{wch:10}];
+      ws['!merges'] = [{s:{r:0,c:0},e:{r:0,c:7}}];
+      const sn = safeSheetName(kelas, used);
+      kelasSheets.push({sn, kelas, n:rows.length, tH, tS, tI, tA, tAll});
+      XLSX.utils.book_append_sheet(wb, ws, sn);
+    });
+
+    kelasSheets.forEach((k,i)=>{
+      const rn = ringkasanStart + i;
+      ringkasan.push([
+        k.kelas, k.n, k.tH, k.tS, k.tI, k.tA,
+        {t:'n', f:`SUM(C${rn}:F${rn})`, v:k.tAll},
+        {t:'n', f:`IF(G${rn}=0,0,C${rn}/G${rn})`, v:k.tAll? k.tH/k.tAll : 0, z:'0%'}
+      ]);
+    });
+    if(kelasSheets.length > 1){
+      const a = ringkasanStart, b = ringkasanStart + kelasSheets.length - 1, tr = b + 1;
+      const S = k => kelasSheets.reduce((x,y)=>x+y[k],0);
+      ringkasan.push(['TOTAL',
+        {t:'n', f:`SUM(B${a}:B${b})`, v:S('n')}, {t:'n', f:`SUM(C${a}:C${b})`, v:S('tH')},
+        {t:'n', f:`SUM(D${a}:D${b})`, v:S('tS')}, {t:'n', f:`SUM(E${a}:E${b})`, v:S('tI')},
+        {t:'n', f:`SUM(F${a}:F${b})`, v:S('tA')}, {t:'n', f:`SUM(G${a}:G${b})`, v:S('tAll')},
+        {t:'n', f:`IF(G${tr}=0,0,C${tr}/G${tr})`, v:S('tAll')? S('tH')/S('tAll') : 0, z:'0%'}
+      ]);
+    }
+    const wsR = XLSX.utils.aoa_to_sheet(ringkasan);
+    wsR['!cols'] = [{wch:16},{wch:14},{wch:9},{wch:9},{wch:9},{wch:9},{wch:12},{wch:10}];
+    wsR['!merges'] = [{s:{r:0,c:0},e:{r:0,c:7}},{s:{r:1,c:0},e:{r:1,c:7}}];
+    XLSX.utils.book_append_sheet(wb, wsR, safeSheetName('Ringkasan', used));
+    wb.SheetNames.unshift(wb.SheetNames.pop()); // Ringkasan jadi sheet pertama
+
+    // Sheet detail harian (hanya jika data punya kolom tanggal)
+    if(records.some(r=>r.tanggal)){
+      const nameOf = {}; siswaList.forEach(st=>{ nameOf[studentKey(st)] = st.nama; });
+      const det = [['Tanggal','Kelas','No','Nama','Status','Keterangan']];
+      records.filter(r=>classes.includes(r.kelas))
+        .sort((a,b)=>String(a.tanggal||'').localeCompare(String(b.tanggal||'')) || a.kelas.localeCompare(b.kelas,'id') || (a.no+'').localeCompare(b.no+'','id',{numeric:true}))
+        .forEach(r=>det.push([String(r.tanggal||'').slice(0,10), r.kelas, isNaN(Number(r.no))?r.no:Number(r.no), r.nama || nameOf[`${r.kelas}::${r.no}`] || '', r.status, r.keterangan || r.catatan || '']));
+      const wsD = XLSX.utils.aoa_to_sheet(det);
+      wsD['!cols'] = [{wch:12},{wch:12},{wch:6},{wch:34},{wch:10},{wch:28}];
+      XLSX.utils.book_append_sheet(wb, wsD, safeSheetName('Detail Harian', used));
+    }
+
+    const label = kelasSel === 'all' ? 'Semua_Kelas' : String(kelasSel).replace(/[^\w\-]+/g,'_');
+    XLSX.writeFile(wb, `Rekap_Kehadiran_${label}_${start}_sd_${end}.xlsx`);
+    toast('File Excel berhasil diunduh');
+  }catch(err){
+    toast('Gagal membuat Excel: '+err.message, true);
+  }finally{ hideLoading(); }
+}
+document.getElementById('btnExcelRekap').addEventListener('click', ()=>{
+  exportRekapExcel(document.getElementById('guruRekapKelas').value || 'all',
+    document.getElementById('guruRekapStart').value, document.getElementById('guruRekapEnd').value);
+});
+document.getElementById('btnExcelKepsek').addEventListener('click', ()=>{
+  exportRekapExcel('all',
+    document.getElementById('kepsekTanggalStart').value, document.getElementById('kepsekTanggalEnd').value);
+});
 
 document.getElementById('btnHadirSemua').addEventListener('click', ()=>{
   const kelas = document.getElementById('guruKelas').value;
